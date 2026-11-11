@@ -1,0 +1,11 @@
+{
+  "name": "smoke",
+  "benchmark_version": "v1.2.2",
+  "cases": [
+    {
+      "suite": "banking",
+      "user_task_id": "user_task_1",
+      "injection_task_id": "injection_task_1"
+    }
+  ]
+}

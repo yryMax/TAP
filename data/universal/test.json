@@ -1,0 +1,41 @@
+{
+  "name": "test",
+  "benchmark_version": "v1.2.2",
+  "cases": [
+    {
+      "suite": "workspace",
+      "user_task_id": "user_task_6",
+      "injection_task_id": "injection_task_4"
+    },
+    {
+      "suite": "banking",
+      "user_task_id": "user_task_5",
+      "injection_task_id": "injection_task_4"
+    },
+    {
+      "suite": "slack",
+      "user_task_id": "user_task_4",
+      "injection_task_id": "injection_task_5"
+    },
+    {
+      "suite": "travel",
+      "user_task_id": "user_task_0",
+      "injection_task_id": "injection_task_0"
+    },
+    {
+      "suite": "travel",
+      "user_task_id": "user_task_1",
+      "injection_task_id": "injection_task_1"
+    },
+    {
+      "suite": "travel",
+      "user_task_id": "user_task_3",
+      "injection_task_id": "injection_task_2"
+    },
+    {
+      "suite": "travel",
+      "user_task_id": "user_task_4",
+      "injection_task_id": "injection_task_3"
+    }
+  ]
+}

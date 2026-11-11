@@ -1,0 +1,96 @@
+{
+  "name": "train18",
+  "benchmark_version": "v1.2.2",
+  "cases": [
+    {
+      "suite": "workspace",
+      "user_task_id": "user_task_0",
+      "injection_task_id": "injection_task_0"
+    },
+    {
+      "suite": "workspace",
+      "user_task_id": "user_task_0",
+      "injection_task_id": "injection_task_1"
+    },
+    {
+      "suite": "workspace",
+      "user_task_id": "user_task_1",
+      "injection_task_id": "injection_task_0"
+    },
+    {
+      "suite": "workspace",
+      "user_task_id": "user_task_1",
+      "injection_task_id": "injection_task_1"
+    },
+    {
+      "suite": "workspace",
+      "user_task_id": "user_task_3",
+      "injection_task_id": "injection_task_0"
+    },
+    {
+      "suite": "workspace",
+      "user_task_id": "user_task_3",
+      "injection_task_id": "injection_task_1"
+    },
+    {
+      "suite": "banking",
+      "user_task_id": "user_task_0",
+      "injection_task_id": "injection_task_0"
+    },
+    {
+      "suite": "banking",
+      "user_task_id": "user_task_0",
+      "injection_task_id": "injection_task_1"
+    },
+    {
+      "suite": "banking",
+      "user_task_id": "user_task_1",
+      "injection_task_id": "injection_task_0"
+    },
+    {
+      "suite": "banking",
+      "user_task_id": "user_task_1",
+      "injection_task_id": "injection_task_1"
+    },
+    {
+      "suite": "banking",
+      "user_task_id": "user_task_2",
+      "injection_task_id": "injection_task_0"
+    },
+    {
+      "suite": "banking",
+      "user_task_id": "user_task_2",
+      "injection_task_id": "injection_task_1"
+    },
+    {
+      "suite": "slack",
+      "user_task_id": "user_task_0",
+      "injection_task_id": "injection_task_1"
+    },
+    {
+      "suite": "slack",
+      "user_task_id": "user_task_0",
+      "injection_task_id": "injection_task_2"
+    },
+    {
+      "suite": "slack",
+      "user_task_id": "user_task_1",
+      "injection_task_id": "injection_task_1"
+    },
+    {
+      "suite": "slack",
+      "user_task_id": "user_task_1",
+      "injection_task_id": "injection_task_2"
+    },
+    {
+      "suite": "slack",
+      "user_task_id": "user_task_3",
+      "injection_task_id": "injection_task_1"
+    },
+    {
+      "suite": "slack",
+      "user_task_id": "user_task_3",
+      "injection_task_id": "injection_task_2"
+    }
+  ]
+}
