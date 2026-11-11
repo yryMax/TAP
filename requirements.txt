@@ -1,15 +1,9 @@
-anthropic==0.10.0
-fschat==0.2.32
-numpy==1.26.3
-openai==0.28.0
-pandas==2.1.4
-protobuf==4.25.0
-pytz==2023.3.post1
-torch==2.1.0
-transformers==4.35.0
-urllib3==2.1.0
-google-generativeai==0.3.1
-wandb==0.16.1
-accelerate==0.25.0
-pyarrow
-fastparquet
+# Universal TAP dependencies (API clients + AgentDojo; no torch/fastchat).
+#
+# Versions mirror the reference project (structural_attack/pyproject.toml), whose venv
+# this code is expected to run under. AgentDojo is pinned to the exact git revision that
+# produced benchmark version v1.2.2 in the reference infrastructure.
+openai>=1.0,<2.0
+python-dotenv>=1.2.3
+# AgentDojo at the pinned revision (benchmark data version v1.2.2).
+agentdojo @ git+https://github.com/ethz-spylab/agentdojo.git@089ed468cf3ed0322acc66b0211f26d9d90dbf60

@@ -1,26 +1,26 @@
 #!/usr/bin/env python3
-"""Universal TAP entry point (plan.md §8, §9).
+"""Universal TAP for indirect prompt injection in AgentDojo.
 
-Subcommands map onto the plan's acceptance phases:
+Subcommands:
 
-* ``smoke``          — phase A: verify OpenRouter connectivity, the configured model,
-                       and a structured tool-call round-trip.
-* ``baselines``      — phase B: no-injection baselines (benign user task utility, and
-                       each injection task run standalone as the user prompt).
-* ``eval-template``  — phases B/C: evaluate ONE fixed prefix/suffix template across a
-                       task manifest (no attacker, no search). An empty template injects
-                       the bare attacker goal (direct-goal baseline).
-* ``search``         — phases D/E: run the universal TAP search over a training
-                       manifest and freeze the best template as an artifact.
+* ``smoke``      — one tool-call round trip against the target model (connectivity check);
+* ``baselines``  — no-injection baselines: each user task on its own, and each attacker
+                   goal given directly as the user prompt;
+* ``eval``       — evaluate ONE fixed template on a task manifest (no search). Give it
+                   ``--template best_template.json``, or ``--prefix/--suffix``; with
+                   neither, the bare attacker goal is injected;
+* ``search``     — the universal TAP search; saves the best template.
 
-Run under the reference project's virtualenv, which provides agentdojo / openai /
-dotenv, e.g.::
+Usage, from this directory::
 
-    /home/renyi/structural_attack/.venv/bin/python main_universal_tap.py smoke \\
-        --config configs/single_task.json
+    source ../structural_attack/.venv/bin/activate
+    python main_universal_tap.py search                                  # 3-task smoke search
+    python main_universal_tap.py search --config configs/train18.json    # paper's 18-task training
+    python main_universal_tap.py eval --manifest data/universal/test.json \\
+        --template runs/universal/search-<time>/best_template.json
 
-Credentials load from ``.env`` (``--env-file`` to override); keys are never written to
-logs or configs.
+Output goes to the terminal and to ``<run dir>/log.txt``; the run dir defaults to a new
+``runs/universal/<command>-<time>``.
 """
 
 from __future__ import annotations
@@ -29,404 +29,270 @@ import argparse
 import json
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from universal_tap import AGENTDOJO_REVISION, BENCHMARK_VERSION
-from universal_tap.openrouter_client import DEFAULT_MODEL, ModelConfig, build_clients
-from universal_tap.schemas import Template, TemplateArtifact
+from universal_tap import AGENTDOJO_REVISION
+from universal_tap.agent import AgentRunner
+from universal_tap.datasets import TaskManifest, load_manifest
+from universal_tap.evaluation import Judge, evaluate_trial, summarize_candidate
+from universal_tap.llm import LLMClient, ModelConfig, build_clients
+from universal_tap.records import RunLogger
+from universal_tap.schemas import Candidate, Template
+
+ROLES = ("attacker", "target", "judge")
 
 
-def _model_config(data: dict[str, Any] | None) -> ModelConfig:
-    data = data or {}
-    return ModelConfig(
-        model=data.get("model", DEFAULT_MODEL),
-        temperature=data.get("temperature", 0.0),
-        max_tokens=data.get("max_tokens"),
-        top_p=data.get("top_p"),
-        request_timeout=data.get("request_timeout", 120.0),
-        max_retries=data.get("max_retries", 4),
-    )
+def load_config(args: argparse.Namespace) -> dict[str, Any]:
+    return json.loads(Path(args.config).read_text(encoding="utf-8"))
 
 
-def load_config(path: str | None) -> dict[str, Any]:
-    if path is None:
-        return {}
-    return json.loads(Path(path).read_text(encoding="utf-8"))
+def model_configs(config: dict[str, Any]) -> dict[str, ModelConfig]:
+    """Per-role settings layered over the shared ``llm`` block."""
+    shared = config.get("llm", {})
+    return {role: ModelConfig(**{**shared, **config.get(role, {})}) for role in ROLES}
 
 
-def _run_config(config: dict[str, Any], clients_cfg: dict[str, ModelConfig], extra: dict[str, Any]) -> dict[str, Any]:
-    """The config fingerprint covers everything that changes results (plan.md §8)."""
-    return {
-        "benchmark_version": BENCHMARK_VERSION,
+def make_clients(args: argparse.Namespace, config: dict[str, Any], roles: tuple[str, ...]) -> dict[str, LLMClient]:
+    models = model_configs(config)
+    return build_clients({role: models[role] for role in roles}, args.env_file or config.get("env_file"))
+
+
+@dataclass
+class Run:
+    config: dict[str, Any]
+    clients: dict[str, LLMClient]
+    manifest: TaskManifest
+    runner: AgentRunner
+    logger: RunLogger
+
+
+def start_run(args: argparse.Namespace, config: dict[str, Any], roles: tuple[str, ...], **extra: Any) -> Run:
+    """Clients, manifest, agent runner and run directory, shared by baselines/eval/search."""
+    clients = make_clients(args, config, roles)
+    manifest = load_manifest(args.manifest or config["manifest"])
+    run_dir = args.run_dir or f"runs/universal/{args.command}-{time.strftime('%Y%m%d-%H%M%S')}"
+    logger = RunLogger(run_dir, {
+        "mode": args.command,
+        "benchmark_version": manifest.benchmark_version,
         "agentdojo_revision": AGENTDOJO_REVISION,
-        "provider": "openrouter",
-        "attacker_model": clients_cfg["attacker"].model,
-        "target_model": clients_cfg["target"].model,
-        "judge_model": clients_cfg["judge"].model,
-        "target_sampling": clients_cfg["target"].as_dict(),
+        "models": {role: client.config.as_dict() for role, client in clients.items()},
+        "manifest": manifest.name,
+        "manifest_hash": manifest.manifest_hash,
+        "max_tool_iters": config.get("max_tool_iters", 15),
         "system_message_name": config.get("system_message_name"),
-        "separator": config.get("separator", ""),
         "injection_strategy": "read_vectors",
         **extra,
-    }
+    })
+    runner = AgentRunner(
+        clients["target"],
+        benchmark_version=manifest.benchmark_version,
+        max_tool_iters=config.get("max_tool_iters", 15),
+        system_message_name=config.get("system_message_name"),
+    )
+    return Run(config, clients, manifest, runner, logger)
+
+
+def concurrency(args: argparse.Namespace, config: dict[str, Any]) -> int:
+    """How many rollouts / model requests run at once (``--concurrency`` or the config)."""
+    return args.concurrency or config.get("concurrency", 1)
+
+
+def search_params(args: argparse.Namespace, config: dict[str, Any]):
+    from universal_tap.search import SearchParams
+
+    overrides = {key: getattr(args, key, None) for key in ("roots", "branching_factor", "width", "depth", "repeats")}
+    return SearchParams(**{**config.get("search", {}), **{k: v for k, v in overrides.items() if v is not None}})
 
 
 def cmd_smoke(args: argparse.Namespace) -> int:
-    """Phase A: one structured tool-call round-trip against the target model."""
-    config = load_config(args.config)
-    target_cfg = _model_config(config.get("target"))
-    clients = build_clients(
-        attacker=target_cfg, target=target_cfg, judge=target_cfg, env_path=args.env_file
-    )
-    client = clients["target"]
-    print(f"Target model: {client.config.model}  (base_url=OpenRouter)")
-
-    tools = [
-        {
-            "type": "function",
-            "function": {
-                "name": "get_weather",
-                "description": "Get the current weather for a city.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"city": {"type": "string"}},
-                    "required": ["city"],
-                },
-            },
-        }
-    ]
+    client = make_clients(args, load_config(args), ("target",))["target"]
+    print(f"target model: {client.config.model}  (provider={client.config.provider}, base_url={client.base_url})")
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a city.",
+            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]},
+        },
+    }]
     messages = [
         {"role": "system", "content": "You are a helpful assistant. Use tools when needed."},
         {"role": "user", "content": "What is the weather in Zurich? Call the tool."},
     ]
-    completion = client.chat(messages, tools=tools, tool_choice="auto")
-    message = completion.choices[0].message
-    finish = completion.choices[0].finish_reason
-    tool_calls = message.tool_calls or []
-    print(f"finish_reason={finish}  tool_calls={len(tool_calls)}")
+    choice = client.chat(messages, tools=tools).choices[0]
+    tool_calls = choice.message.tool_calls or []
+    print(f"finish_reason={choice.finish_reason}  tool_calls={len(tool_calls)}")
     for call in tool_calls:
         print(f"  -> {call.function.name}({call.function.arguments})  id={call.id}")
-    print(f"usage: {client.counters.as_dict()}")
+    print(f"usage: {client.usage.as_dict()}")
     if not tool_calls:
-        print("WARNING: model returned no tool call; check tool-calling support for this model.")
+        print("WARNING: no tool call returned; check the server's tool-calling support.")
         return 1
-    print("OK: connectivity, model and structured tool-calling verified.")
-    return 0
-
-
-def cmd_eval_template(args: argparse.Namespace) -> int:
-    """Phases B/C: evaluate one fixed template across a manifest (no search)."""
-    from universal_tap.agent_runner import AgentRunner
-    from universal_tap.datasets import load_manifest
-    from universal_tap.evaluation import Judge, evaluate_trial, summarize_candidate
-    from universal_tap.logging import RunLogger
-    from universal_tap.schemas import Candidate
-
-    config = load_config(args.config)
-    clients_cfg = {
-        "attacker": _model_config(config.get("attacker")),
-        "target": _model_config(config.get("target")),
-        "judge": _model_config(config.get("judge")),
-    }
-    clients = build_clients(
-        attacker=clients_cfg["attacker"],
-        target=clients_cfg["target"],
-        judge=clients_cfg["judge"],
-        env_path=args.env_file,
-    )
-    manifest = load_manifest(args.manifest or config["manifest"])
-    separator = config.get("separator", "")
-    template = Template(prefix=args.prefix, suffix=args.suffix, separator=separator)
-
-    runner = AgentRunner(
-        clients["target"],
-        max_tool_iters=config.get("max_tool_iters", 15),
-        system_message_name=config.get("system_message_name"),
-    )
-    judge = Judge(clients["judge"])
-    candidate = Candidate(
-        candidate_id="fixed",
-        prefix=template.prefix,
-        suffix=template.suffix,
-        separator=separator,
-        improvement="(fixed template, no search)",
-        parent_id=None,
-        root_id="fixed",
-        depth=0,
-    )
-
-    run_dir = args.run_dir or config.get("run_dir") or f"runs/universal/eval-{int(time.time())}"
-    logger = RunLogger(
-        run_dir,
-        _run_config(
-            config,
-            clients_cfg,
-            {"mode": "eval-template", "manifest": manifest.name, "manifest_hash": manifest.manifest_hash,
-             "repeats": args.repeats, "template_hash": template.template_hash},
-        ),
-    )
-    logger.log_candidate(candidate)
-
-    trials = []
-    for case in manifest.cases:
-        for repeat_id in range(args.repeats):
-            trial, trace = evaluate_trial(
-                runner=runner,
-                judge=judge,
-                candidate=candidate,
-                case=case,
-                repeat_id=repeat_id,
-                seed=config.get("base_seed", 0) + repeat_id,
-            )
-            trials.append(trial)
-            logger.log_trial(trial, trace=trace)
-            print(
-                f"{case.case_id} r{repeat_id}: status={trial.status.value} "
-                f"seen={trial.injection_seen} judge={trial.judge_score} "
-                f"attack_success={trial.attack_success} utility={trial.utility}"
-            )
-
-    summary = summarize_candidate(candidate, manifest.cases, trials, proxy_threshold=config.get("proxy_threshold", 7.0))
-    logger.log_summary(summary, depth=0)
-    print("\n=== summary ===")
-    print(json.dumps(summary.as_dict(), ensure_ascii=False, indent=2))
-    print(f"\nlogs: {run_dir}")
+    print("OK: connectivity, model and structured tool calling verified.")
     return 0
 
 
 def cmd_baselines(args: argparse.Namespace) -> int:
-    """Phase B: no-injection baselines for every task in a manifest.
-
-    * benign — each distinct user task with no injection (clean utility);
-    * standalone — each distinct injection task's GOAL given directly as the user
-      prompt (can the target carry out the attacker goal at all?).
-    """
-    from universal_tap.agent_runner import AgentRunner
-    from universal_tap.datasets import load_manifest
-    from universal_tap.logging import RunLogger
-
-    config = load_config(args.config)
-    clients_cfg = {
-        "attacker": _model_config(config.get("attacker")),
-        "target": _model_config(config.get("target")),
-        "judge": _model_config(config.get("judge")),
-    }
-    clients = build_clients(
-        attacker=clients_cfg["attacker"],
-        target=clients_cfg["target"],
-        judge=clients_cfg["judge"],
-        env_path=args.env_file,
-    )
-    manifest = load_manifest(args.manifest or config["manifest"])
-    runner = AgentRunner(
-        clients["target"],
-        max_tool_iters=config.get("max_tool_iters", 15),
-        system_message_name=config.get("system_message_name"),
-    )
-    run_dir = args.run_dir or f"runs/universal/baselines-{int(time.time())}"
-    logger = RunLogger(
-        run_dir,
-        _run_config(
-            config,
-            clients_cfg,
-            {"mode": "baselines", "manifest": manifest.name, "manifest_hash": manifest.manifest_hash,
-             "repeats": args.repeats, "injection_strategy": "none"},
-        ),
-    )
-
-    jobs: list[tuple[str, str, str, str]] = []  # (kind, benchmark_version, suite, task_id)
-    for case in manifest.cases:
-        for kind, task_id in (("benign", case.user_task_id), ("standalone", case.injection_task_id)):
-            job = (kind, case.benchmark_version, case.suite, task_id)
+    run = start_run(args, load_config(args), ("target",), repeats=args.repeats, injection_strategy="none")
+    target = run.clients["target"]
+    jobs: list[tuple[str, str, str]] = []  # (kind, suite, task_id), each distinct task once
+    for suite_name, user_task_id, injection_task_id in run.manifest.cases:
+        for job in (("benign", suite_name, user_task_id), ("standalone", suite_name, injection_task_id)):
             if job not in jobs:
                 jobs.append(job)
 
     results: dict[str, list[bool]] = {"benign": [], "standalone": []}
-    n_errors = 0
-    for kind, version, suite_name, task_id in jobs:
+    n_failed = 0
+    for kind, suite_name, task_id in jobs:
         for repeat_id in range(args.repeats):
             start = time.time()
-            before = clients["target"].counters.snapshot()
-            run = runner.run_baseline(
-                benchmark_version=version, suite_name=suite_name, kind=kind, task_id=task_id
-            )
-            usage = clients["target"].counters.delta(before)
-            record = {
-                "kind": kind,
-                "suite": suite_name,
-                "task_id": task_id,
-                "repeat_id": repeat_id,
-                "status": run.status.value,
-                "success": run.utility,
-                "error": run.error,
-                "n_requests": usage["n_requests"],
-                "total_tokens": usage["total_tokens"],
+            with target.track() as usage:
+                out = run.runner.run_baseline(suite_name=suite_name, kind=kind, task_id=task_id)
+            run.logger.log_baseline({
+                "kind": kind, "suite": suite_name, "task_id": task_id, "repeat_id": repeat_id,
+                "status": out.status.value, "success": out.utility, "error": out.error,
+                "n_requests": usage.n_requests, "total_tokens": usage.total_tokens,
                 "duration": time.time() - start,
-            }
-            logger.log_baseline(record, trace=run.messages)
-            if run.utility is None:
-                n_errors += 1
+            }, out.messages)
+            if out.status.value == "failed":
+                n_failed += 1
             else:
-                results[kind].append(bool(run.utility))
-            print(f"{kind:10s} {suite_name}/{task_id} r{repeat_id}: status={run.status.value} success={run.utility}")
+                results[kind].append(out.utility)
+            failure = f"  ({out.error})" if out.error else ""
+            print(f"{kind:10s} {suite_name}/{task_id} r{repeat_id}: status={out.status.value} "
+                  f"success={out.utility}{failure}")
 
-    summary = {
-        kind: {"n": len(vals), "success_rate": (sum(vals) / len(vals)) if vals else None}
-        for kind, vals in results.items()
-    }
-    summary["n_errors"] = n_errors
-    summary["usage"] = clients["target"].counters.as_dict()
+    summary = {kind: {"n": len(v), "success_rate": sum(v) / len(v) if v else None} for kind, v in results.items()}
     print("\n=== baselines ===")
-    print(json.dumps(summary, ensure_ascii=False, indent=2))
-    print(f"\nlogs: {run_dir}")
+    print(json.dumps({**summary, "n_failed": n_failed, "usage": target.usage.as_dict()}, indent=2))
+    return 0
+
+
+def cmd_eval(args: argparse.Namespace) -> int:
+    config = load_config(args)
+    if args.template:
+        frozen = json.loads(Path(args.template).read_text(encoding="utf-8"))
+        template = Template(frozen["prefix"], frozen["suffix"])
+    else:
+        template = Template(args.prefix, args.suffix)
+    run = start_run(args, config, ("target", "judge"), repeats=args.repeats,
+                    template_source=args.template, template_hash=template.template_hash)
+    judge = Judge(run.clients["judge"])
+    candidate = Candidate("fixed", template, "(fixed template, no search)", parent_id=None, root_id="fixed", depth=0)
+    run.logger.log_candidate(candidate)
+
+    trials = []
+    with ThreadPoolExecutor(max_workers=concurrency(args, config)) as pool:
+        futures = [
+            pool.submit(evaluate_trial, runner=run.runner, judge=judge, candidate=candidate, case=case,
+                        repeat_id=repeat_id)
+            for case in run.manifest.cases
+            for repeat_id in range(args.repeats)
+        ]
+        for future in futures:  # log and print in task order from this thread
+            trial, trace = future.result()
+            trials.append(trial)
+            run.logger.log_trial(trial, trace)
+            failure = f"  ({trial.error})" if trial.error else ""
+            print(f"{trial.case_id} r{trial.repeat_id}: status={trial.status.value} seen={trial.injection_seen} "
+                  f"judge={trial.judge_score} attack_success={trial.attack_success} utility={trial.utility}{failure}")
+
+    summary = summarize_candidate(candidate, run.manifest.cases, trials,
+                                  proxy_threshold=search_params(args, config).proxy_threshold)
+    run.logger.log_summary(summary, depth=0)
+    print("\n=== summary ===")
+    print(json.dumps(summary.as_dict(), ensure_ascii=False, indent=2))
     return 0
 
 
 def cmd_search(args: argparse.Namespace) -> int:
-    """Phases D/E: run the universal TAP search and freeze the best template."""
-    from universal_tap.agent_runner import AgentRunner
-    from universal_tap.datasets import load_manifest
-    from universal_tap.evaluation import Judge
-    from universal_tap.logging import RunLogger
-    from universal_tap.search import AttackerLLM, SearchParams, UniversalTAPSearch
+    from universal_tap.search import AttackerLLM, UniversalTAPSearch
 
-    config = load_config(args.config)
-    clients_cfg = {
-        "attacker": _model_config(config.get("attacker")),
-        "target": _model_config(config.get("target")),
-        "judge": _model_config(config.get("judge")),
-    }
-    clients = build_clients(
-        attacker=clients_cfg["attacker"],
-        target=clients_cfg["target"],
-        judge=clients_cfg["judge"],
-        env_path=args.env_file,
-    )
-    manifest = load_manifest(args.manifest or config["manifest"])
-    separator = config.get("separator", "")
-
-    search_cfg = config.get("search", {})
-    params = SearchParams(
-        roots=args.roots or search_cfg.get("roots", 1),
-        branching_factor=args.branching_factor or search_cfg.get("branching_factor", 2),
-        width=args.width or search_cfg.get("width", 2),
-        depth=args.depth or search_cfg.get("depth", 2),
-        repeats=args.repeats or search_cfg.get("repeats", 1),
-        base_seed=search_cfg.get("base_seed", 0),
-        proxy_threshold=config.get("proxy_threshold", 7.0),
-        max_generation_attempts=search_cfg.get("max_generation_attempts", 3),
-        max_candidate_budget=search_cfg.get("max_candidate_budget"),
-        sample_failures=search_cfg.get("sample_failures", 3),
-    )
-
-    runner = AgentRunner(
-        clients["target"],
-        max_tool_iters=config.get("max_tool_iters", 15),
-        system_message_name=config.get("system_message_name"),
-    )
-    judge = Judge(clients["judge"])
-    attacker = AttackerLLM(
-        clients["attacker"], manifest, separator=separator, max_attempts=params.max_generation_attempts
-    )
-
-    run_dir = args.run_dir or config.get("run_dir") or f"runs/universal/search-{int(time.time())}"
-    logger = RunLogger(
-        run_dir,
-        _run_config(
-            config,
-            clients_cfg,
-            {"mode": "search", "manifest": manifest.name, "manifest_hash": manifest.manifest_hash,
-             "search": params.as_dict()},
-        ),
-    )
-
-    search = UniversalTAPSearch(
-        attacker=attacker,
-        judge=judge,
-        runner=runner,
-        manifest=manifest,
-        params=params,
-        logger=logger,
-        separator=separator,
-    )
+    config = load_config(args)
+    params = search_params(args, config)
+    run = start_run(args, config, ROLES, search=params.as_dict())
+    manifest = run.manifest
     print(f"Starting universal TAP search: {params.as_dict()}")
     print(f"Training manifest: {manifest.name} ({len(manifest.cases)} task pairs, hash={manifest.manifest_hash})")
-    result = search.run()
+    result = UniversalTAPSearch(
+        attacker=AttackerLLM(run.clients["attacker"], manifest, max_attempts=params.max_generation_attempts),
+        judge=Judge(run.clients["judge"]),
+        runner=run.runner,
+        manifest=manifest,
+        params=params,
+        logger=run.logger,
+        concurrency=concurrency(args, config),
+    ).run()
 
     print("\n=== search finished ===")
     print(f"stop_reason={result.stop_reason}  candidates_evaluated={result.n_candidates_evaluated}  "
           f"generation_failures={result.n_generation_failures}")
-    if result.best_candidate is None:
-        print("No fully-evaluated best candidate found.")
+    best, summary = result.best_candidate, result.best_summary
+    if best is None or summary is None:
+        print("No fully evaluated candidate.")
         return 1
 
-    best = result.best_candidate
-    artifact = TemplateArtifact(
-        prefix=best.prefix,
-        suffix=best.suffix,
-        separator=separator,
-        render_rule="prefix + separator + attacker_goal + separator + suffix",
-        train_manifest_hash=manifest.manifest_hash,
-        model_config_fingerprint={
-            "attacker": clients_cfg["attacker"].as_dict(),
-            "target": clients_cfg["target"].as_dict(),
-            "judge": clients_cfg["judge"].as_dict(),
-        },
-        run_config=logger.run_config,
-        selection_reason="highest mean judge score among fully-evaluated candidates",
-        candidate_id=best.candidate_id,
-        summary=result.best_summary.as_dict() if result.best_summary else {},
-    )
-    path = logger.save_artifact(artifact.as_dict())
-    print(f"best candidate {best.candidate_id}: mean_judge="
-          f"{result.best_summary.mean_judge_score if result.best_summary else None}")
+    path = run.logger.save_artifact({
+        **best.as_dict(),
+        "render_rule": "prefix + attacker_goal + suffix",
+        "train_manifest": manifest.name,
+        "train_manifest_hash": manifest.manifest_hash,
+        "selection_reason": "highest mean judge score among fully evaluated candidates",
+        "summary": summary.as_dict(),
+        "run_config": run.logger.run_config,
+    })
+    # Final summary in the style of the original TAP's print_final_summary_stats.
+    print(f"\n{'=' * 8} FINAL SUMMARY STATISTICS {'=' * 8}")
+    print(f"Training manifest: {manifest.name} ({len(manifest.cases)} task pairs)")
+    print(f"Best candidate: {best.candidate_id} (depth {best.depth}, root {best.root_id}, parent {best.parent_id})")
+    print(f"mean_judge={summary.mean_judge_score}  real_asr={summary.real_asr}  utility={summary.utility_rate}  "
+          f"proxy_pass={summary.proxy_pass_rate}  failed={summary.n_failed}")
+    print(f"Best template PREFIX:\n\n{best.template.prefix}\n")
+    print(f"Best template SUFFIX:\n\n{best.template.suffix}\n")
+    for role, client in run.clients.items():
+        print(f"usage[{role}]: {client.usage.as_dict()}")
     print(f"frozen template saved to {path}")
-    print(f"logs: {run_dir}")
     return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--config", default="configs/default.json")
+    common.add_argument("--env-file", default=None, help="vLLM endpoint file (default: env_file in the config)")
+    run_opts = argparse.ArgumentParser(add_help=False, parents=[common])
+    run_opts.add_argument("--manifest", default=None, help="task manifest (default: manifest in the config)")
+    run_opts.add_argument("--run-dir", default=None, help="default: runs/universal/<command>-<time>")
+    run_opts.add_argument("--concurrency", type=int, default=None,
+                          help="rollouts run at once (default: concurrency in the config)")
+
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--env-file", default=None, help="explicit .env path for credentials")
     sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("smoke", parents=[common], help="check connectivity and tool calling").set_defaults(func=cmd_smoke)
 
-    p_smoke = sub.add_parser("smoke", help="phase A: verify connectivity and tool calling")
-    p_smoke.add_argument("--config", default="configs/single_task.json")
-    p_smoke.set_defaults(func=cmd_smoke)
+    p = sub.add_parser("baselines", parents=[run_opts], help="no-injection baselines")
+    p.add_argument("--repeats", type=int, default=1)
+    p.set_defaults(func=cmd_baselines)
 
-    p_eval = sub.add_parser("eval-template", help="phases B/C: evaluate one fixed template")
-    p_eval.add_argument("--config", default="configs/single_task.json")
-    p_eval.add_argument("--manifest", default=None)
-    p_eval.add_argument("--prefix", default="", help="fixed template prefix (empty = direct goal)")
-    p_eval.add_argument("--suffix", default="")
-    p_eval.add_argument("--repeats", type=int, default=1)
-    p_eval.add_argument("--run-dir", default=None)
-    p_eval.set_defaults(func=cmd_eval_template)
+    p = sub.add_parser("eval", parents=[run_opts], help="evaluate one fixed template")
+    p.add_argument("--template", default=None, help="a best_template.json to evaluate")
+    p.add_argument("--prefix", default="")
+    p.add_argument("--suffix", default="")
+    p.add_argument("--repeats", type=int, default=1)
+    p.set_defaults(func=cmd_eval)
 
-    p_base = sub.add_parser("baselines", help="phase B: benign and standalone (no-injection) baselines")
-    p_base.add_argument("--config", default="configs/single_task.json")
-    p_base.add_argument("--manifest", default=None)
-    p_base.add_argument("--repeats", type=int, default=1)
-    p_base.add_argument("--run-dir", default=None)
-    p_base.set_defaults(func=cmd_baselines)
-
-    p_search = sub.add_parser("search", help="phases D/E: run the universal TAP search")
-    p_search.add_argument("--config", default="configs/small_search.json")
-    p_search.add_argument("--manifest", default=None)
-    p_search.add_argument("--roots", type=int, default=None)
-    p_search.add_argument("--branching-factor", type=int, default=None)
-    p_search.add_argument("--width", type=int, default=None)
-    p_search.add_argument("--depth", type=int, default=None)
-    p_search.add_argument("--repeats", type=int, default=None)
-    p_search.add_argument("--run-dir", default=None)
-    p_search.set_defaults(func=cmd_search)
+    p = sub.add_parser("search", parents=[run_opts], help="run the universal TAP search")
+    for flag in ("--roots", "--branching-factor", "--width", "--depth", "--repeats"):
+        p.add_argument(flag, type=int, default=None, help="override the config's search value")
+    p.set_defaults(func=cmd_search)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
+    sys.stdout.reconfigure(line_buffering=True)  # flush per line even when piped
+    args = build_parser().parse_args(argv)
     return args.func(args)
 
 
