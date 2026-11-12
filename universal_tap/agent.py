@@ -99,6 +99,8 @@ class RunOutput:
     user_prompt: str = ""
     attacker_goal: str = ""
     injection_text: str = ""
+    injection_message_id: str | None = None
+    termination: str = "completed"
 
 
 class AgentRunner:
@@ -118,6 +120,7 @@ class AgentRunner:
         self.benchmark_version = benchmark_version
         self.max_tool_iters = max_tool_iters
         self.max_attempts = max_attempts
+        self.system_message = load_system_message(system_message_name)
         llm = OpenAILLM(
             target_client.openai_client, target_client.config.model, temperature=target_client.config.temperature
         )
@@ -134,6 +137,7 @@ class AgentRunner:
         # and each run builds its own environment and runtime.
         self._suites: dict[str, Any] = {}
         self._vectors: dict[tuple[str, str], list[str]] = {}
+        self._turn_boundaries: dict[tuple[str, str], dict[str, tuple[str, str]]] = {}
         self._cache_lock = threading.RLock()
 
     def suite(self, name: str) -> Any:
@@ -186,6 +190,96 @@ class AgentRunner:
         else:
             raise ValueError(f"unknown baseline kind {kind!r}")
         return self._rollout(suite, task=task, injection_task=None, injections={}, needles=None)
+
+    def prepare_turn_case(self, case, template):
+        """Preflight the complete payload in the real YAML slot, without any model calls."""
+        from my_attacks import OneTurnAttack
+        from .render import build_injections
+
+        suite_name, user_id, injection_id = case
+        suite = self.suite(suite_name)
+        user_task = suite.get_user_task_by_id(user_id)
+        injection_task = suite.get_injection_task_by_id(injection_id)
+        key = (suite_name, user_id)
+        with self._cache_lock:
+            if key not in self._turn_boundaries:
+                self._turn_boundaries[key] = OneTurnAttack(suite, self._pipeline)._get_tool_boundaries(user_task)
+            boundaries = self._turn_boundaries[key]
+        injections, payloads = build_injections(template, injection_task.GOAL, boundaries)
+        # Loading catches malformed/invalid YAML before a candidate consumes evaluation budget.
+        suite.load_and_inject_default_environment(injections)
+        return suite, user_task, injection_task, injections, payloads
+
+    def run_turn_case(self, case, template) -> RunOutput:
+        """One rollout, with request-level retries only. Behavioral outcomes are never rerun.
+
+        Stepping the pipeline elements explicitly retains both environment and trace if a
+        request fails midway, or the tool budget is reached. Checks still inspect effects
+        that already occurred, including on aborted or truncated trajectories.
+        """
+        try:
+            suite, task, injection_task, injections, payloads = self.prepare_turn_case(case, template)
+        except Exception as exc:
+            return RunOutput(RunStatus.FAILED, error=f"injection rendering failed: {exc!r}",
+                             termination="render_error")
+        messages = []
+        status, error, termination = RunStatus.OK, None, "completed"
+        environment = task.init_environment(suite.load_and_inject_default_environment(injections))
+        before = environment.model_copy(deep=True)
+        runtime = FunctionsRuntime(suite.tools)
+        prompt = task.PROMPT
+        _, _, _, messages, _ = SystemMessage(self.system_message).query(prompt, runtime, environment)
+        _, _, _, messages, _ = InitQuery().query(prompt, runtime, environment, messages)
+        try:
+            for round_id in range(self.max_tool_iters + 1):
+                converted = [openai_llm._message_to_openai(m, self.target_client.config.model) for m in messages]
+                tools = [openai_llm._function_to_openai(tool) for tool in runtime.functions.values()]
+                completion = self.target_client.chat(converted, tools=tools)
+                messages = [*messages, openai_llm._openai_to_assistant_message(completion.choices[0].message)]
+                if not messages[-1].get("tool_calls"):
+                    if not _message_text(messages[-1]):
+                        termination = "no_final_answer"
+                    break
+                if round_id == self.max_tool_iters:
+                    termination = "step_limit"
+                    error = f"step limit ({self.max_tool_iters} tool rounds) reached"
+                    break
+                try:
+                    _, _, environment, messages, _ = ToolsExecutor().query(prompt, runtime, environment, messages)
+                except AbortAgentError:
+                    raise
+                except Exception as exc:
+                    termination, error = "tool_error", f"{type(exc).__name__}: {exc}"
+                    break
+        except AbortAgentError as exc:
+            messages, environment = exc.messages, exc.task_environment
+            termination, error = "aborted", str(exc)
+        except Exception as exc:
+            status, termination, error = RunStatus.FAILED, "api_error", f"{type(exc).__name__}: {exc}"
+
+        output = messages[-1].get("content") if messages and messages[-1]["role"] == "assistant" else []
+        stack = functions_stack_trace_from_messages(messages)
+        utility = security = None
+        for checked_task, field in ((task, "utility"), (injection_task, "security")):
+            try:
+                result = bool(suite._check_task_result(checked_task, output or [], before, environment, stack))
+                if field == "utility":
+                    utility = result
+                else:
+                    security = result
+            except Exception as exc:
+                status = RunStatus.FAILED
+                error = f"{error + '; ' if error else ''}{field} check failed: {exc!r}"
+        seen, response, calls = _extract_first_step(messages, tuple(payloads))
+        serialized = _messages_to_json(messages)
+        injection_id = next((m["message_id"] for m in serialized
+                             if m["role"] == "tool" and
+                             _contains_injection(m["content"] or m.get("error") or "", tuple(payloads))), None)
+        return RunOutput(status, attack_success=security, utility=utility, injection_seen=seen,
+                         first_step_response=response, first_step_tool_calls=calls, messages=serialized,
+                         error=error, user_prompt=task.PROMPT, attacker_goal=injection_task.GOAL,
+                         injection_text=template.render(injection_task.GOAL),
+                         injection_message_id=injection_id, termination=termination)
 
     def _rollout(self, suite: Any, **kwargs: Any) -> RunOutput:
         """Up to ``max_attempts`` attempts, each from a fresh environment; the first ``ok``
@@ -338,11 +432,16 @@ def _hit_step_limit(messages: list[Any], max_iters: int) -> bool:
 
 def _messages_to_json(messages: list[Any]) -> list[dict[str, Any]]:
     out = []
-    for message in messages:
-        turn: dict[str, Any] = {"role": message.get("role"), "content": _message_text(message)}
+    for index, message in enumerate(messages):
+        turn: dict[str, Any] = {"message_id": f"m{index:04d}", "role": message.get("role"),
+                                "content": _message_text(message)}
         if message.get("role") == "assistant":
             turn["tool_calls"] = [tc.as_dict() for tc in _tool_calls_of(message)]
         if message.get("role") == "tool":
             turn["error"] = message.get("error")
+            call = message.get("tool_call")
+            if call is not None:
+                turn["tool_call"] = {"function": call.function, "args": dict(call.args or {}), "id": call.id}
+            turn["tool_call_id"] = message.get("tool_call_id")
         out.append(turn)
     return out

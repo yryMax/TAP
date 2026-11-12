@@ -54,7 +54,7 @@ class RunLogger:
     """Single writer for one run directory. Creating it also mirrors stdout/stderr into
     ``log.txt``."""
 
-    def __init__(self, run_dir: str | Path, run_config: dict[str, Any]) -> None:
+    def __init__(self, run_dir: str | Path, run_config: dict[str, Any], *, resume: bool = False) -> None:
         self.run_dir = Path(run_dir)
         self.traces_dir = self.run_dir / "traces"
         self.traces_dir.mkdir(parents=True, exist_ok=True)
@@ -62,15 +62,30 @@ class RunLogger:
         payload = json.dumps(run_config, ensure_ascii=False, sort_keys=True)
         self.fingerprint = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
         self.run_config = run_config
-        _atomic_write(
-            self.run_dir / "run_config.json",
-            {"run_id": self.run_id, "fingerprint": self.fingerprint, **run_config},
-        )
+        if resume:
+            saved = json.loads((self.run_dir / "run_config.json").read_text(encoding="utf-8"))
+            if saved["fingerprint"] != self.fingerprint:
+                raise ValueError("resume config differs from the saved run (models, data, renderer or search parameters)")
+            self.run_id = saved["run_id"]
+        else:
+            _atomic_write(
+                self.run_dir / "run_config.json",
+                {"run_id": self.run_id, "fingerprint": self.fingerprint, **run_config},
+            )
 
         log_file = (self.run_dir / "log.txt").open("a", encoding="utf-8")
+        self._log_file = log_file
+        self._stdout, self._stderr = sys.stdout, sys.stderr
         sys.stdout = _Tee(sys.stdout, log_file)
         sys.stderr = _Tee(sys.stderr, log_file)
         print(f"run dir: {self.run_dir}  (output also saved to {self.run_dir / 'log.txt'})")
+
+    def close(self) -> None:
+        if isinstance(sys.stdout, _Tee) and sys.stdout._log_file is self._log_file:
+            sys.stdout = self._stdout
+        if isinstance(sys.stderr, _Tee) and sys.stderr._log_file is self._log_file:
+            sys.stderr = self._stderr
+        self._log_file.close()
 
     def _append(self, name: str, record: dict[str, Any]) -> None:
         with (self.run_dir / name).open("a", encoding="utf-8") as fh:
@@ -92,7 +107,14 @@ class RunLogger:
              "case_id": trial.case_id, "repeat_id": trial.repeat_id, "status": trial.status.value},
             trace,
         )
-        self._append("trials.jsonl", {"fingerprint": self.fingerprint, **trial.as_dict()})
+        extra = {"messages": trace} if hasattr(trial, "grade") else {}
+        self._append("trials.jsonl", {"fingerprint": self.fingerprint, **trial.as_dict(), **extra})
+
+    def log_invalid_candidate(self, record: dict[str, Any]) -> None:
+        self._append("candidates.jsonl", record)
+
+    def log_mutation(self, record: dict[str, Any]) -> None:
+        self._append("mutations.jsonl", record)
 
     def log_baseline(self, record: dict[str, Any], trace: list[dict[str, Any]]) -> None:
         name = f"{record['kind']}__{record['suite']}__{record['task_id']}__r{record['repeat_id']}.json"

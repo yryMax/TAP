@@ -129,3 +129,59 @@ class CandidateSummary:
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass
+class TurnTrialResult(TrialResult):
+    grade: int = 0
+    labels: dict[str, dict[str, Any]] = field(default_factory=dict)
+    injection_message_id: str | None = None
+    termination: str = "completed"
+    judge_error: str | None = None
+    judge_version: str = ""
+    evaluator_requests: int = 0
+    evaluator_tokens: int = 0
+    judge_outputs: list[str] = field(default_factory=list)
+    rollout_status: str = "ok"
+    rollout_error: str | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {**super().as_dict(), "security": self.attack_success}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]):
+        from dataclasses import fields
+        values = {f.name: data[f.name] for f in fields(cls) if f.name in data}
+        values["status"] = RunStatus(values["status"])
+        values["first_step_tool_calls"] = [ToolCallRecord(**call) for call in values.get("first_step_tool_calls", [])]
+        return cls(**values)
+
+
+@dataclass
+class TurnSummary:
+    candidate_id: str
+    template_hash: str
+    n_turns: int
+    n_tasks_total: int
+    repeats: int
+    expected_trials: int
+    n_trials: int
+    n_failed: int
+    n_missing: int
+    fully_evaluated: bool
+    security_rate: float
+    utility_rate: float
+    mean_grade: float
+    grade_distribution: dict[str, int]
+    unknown_counts: dict[str, int]
+    per_case: list[dict[str, Any]]
+    n_requests: int = 0
+    total_tokens: int = 0
+    duration: float = 0.0
+
+    @property
+    def rank_key(self) -> tuple[float, float, int]:
+        return self.security_rate, self.mean_grade, -self.n_turns
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)

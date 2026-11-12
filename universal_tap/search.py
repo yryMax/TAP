@@ -371,3 +371,308 @@ class UniversalTAPSearch:
                     self._attach_feedback(node)
 
         return SearchResult(best, best_summary, n_evaluated, n_gen_failures, stop_reason)
+
+
+# Turn-level mode keeps the original prefix/suffix implementation above intact.
+from pathlib import Path
+
+from .evaluation import (TurnJudge, evaluate_turn_trial, summarize_turn_candidate, turn_feedback)
+from .prompts import TURN_JUDGE_VERSION, turn_mutator_system_prompt
+from .schemas import TurnSummary, TurnTrialResult
+from .turns import (InvalidMutation, TurnCandidate, TurnTemplate, apply_operation,
+                    operation_key, parse_json_object, root_template)
+
+
+@dataclass
+class TurnSearchParams:
+    roots: int = 1
+    branching_factor: int = 3
+    width: int = 8
+    depth: int = 5
+    max_turns: int = 13
+    max_candidates: int = 73
+    repeats: int = 1
+    renderer: str = "plain_roles"
+    max_generation_attempts: int = 3
+
+    def __post_init__(self):
+        for key in ("roots", "branching_factor", "width", "max_turns", "max_candidates", "repeats",
+                    "max_generation_attempts"):
+            if type(getattr(self, key)) is not int or getattr(self, key) < 1:
+                raise ValueError(f"{key} must be a positive integer")
+        if type(self.depth) is not int or self.depth < 0:
+            raise ValueError("depth must be a nonnegative integer")
+        if self.roots > self.max_candidates:
+            raise ValueError("max_candidates must cover every root")
+        root_template(self.renderer)
+
+    def as_dict(self):
+        return asdict(self)
+
+
+def load_tool_catalog(directory: str | Path) -> list[dict[str, Any]]:
+    """Static JSON only. In particular this never loads roots, goals, suites or a runtime."""
+    catalogs = []
+    def compact(value):
+        if isinstance(value, dict):
+            return {k: compact(v) for k, v in value.items() if k != "title"}
+        if isinstance(value, list):
+            return [compact(v) for v in value]
+        return value
+    for suite in ("workspace", "banking", "slack", "travel"):
+        data = json.loads((Path(directory) / f"{suite}.json").read_text(encoding="utf-8"))
+        catalogs.append({"suite": suite, "tools": [
+            {"name": tool["name"], "description": tool["description"],
+             "parameters": compact(tool["parameters"]),
+             "response_schema": compact(tool["response"].get("schema"))}
+            for tool in data["tools"]]})
+    return catalogs
+
+
+class TurnMutator:
+    def __init__(self, client: LLMClient, *, tool_catalog, max_turns: int, max_attempts: int = 3):
+        self.client, self.max_turns, self.max_attempts = client, max_turns, max_attempts
+        self.system_prompt = turn_mutator_system_prompt(tool_catalog, max_turns)
+
+    def generate(self, parent: TurnCandidate, feedback: dict, excluded: list[str]):
+        messages = [{"role": "system", "content": self.system_prompt},
+                    {"role": "user", "content": json.dumps({"feedback": feedback,
+                        "excluded_sibling_operations": [json.loads(op) for op in excluded]}, ensure_ascii=False)}]
+        attempts = []
+        start = time.monotonic()
+        with self.client.track() as usage:
+            for _ in range(self.max_attempts):
+                raw, operation, reason = "", None, None
+                try:
+                    response = self.client.chat(messages)
+                    raw = response.choices[0].message.content or ""
+                    operation = parse_json_object(raw)
+                    template = apply_operation(parent.template, operation, self.max_turns)
+                    if operation_key(operation) in excluded:
+                        raise InvalidMutation("duplicate operation for this parent")
+                    if template.template_hash == parent.template.template_hash:
+                        raise InvalidMutation("operation leaves rendered payload unchanged")
+                except Exception as exc:
+                    reason = f"{type(exc).__name__}: {exc}"
+                attempts.append({"raw": raw, "op": operation, "invalid_reason": reason})
+                if reason is None:
+                    break
+                messages = messages[:2] + [{"role": "user", "content":
+                    f"Invalid mutation: {reason}. Return one corrected operation as JSON."}]
+            return attempts, {**usage.as_dict(), "duration": time.monotonic() - start}
+
+
+def _read_jsonl(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    records = []
+    lines = path.read_bytes().splitlines(keepends=True)
+    for index, line in enumerate(lines):
+        try:
+            records.append(json.loads(line))
+        except (ValueError, UnicodeError):
+            if index != len(lines) - 1 or line.endswith(b"\n"):
+                raise
+            # A killed process may leave a partial final append; retain all complete rows.
+            path.write_bytes(b"".join(lines[:index]))
+    return records
+
+
+class TurnTAPSearch:
+    """Beam search with evaluated roots, parent retention and durable trial reuse."""
+
+    def __init__(self, *, mutator, judge, runner, manifest, params, logger, roots=None,
+                 concurrency=1, resume=False):
+        self.mutator, self.judge, self.runner = mutator, judge, runner
+        self.manifest, self.params, self.logger = manifest, params, logger
+        self.concurrency = max(1, concurrency)
+        self.candidates: dict[str, TurnCandidate] = {}
+        self.summaries: dict[str, TurnSummary] = {}
+        self.trials: dict[str, list[TurnTrialResult]] = {}
+        self.state = {"version": 1, "fingerprint": logger.fingerprint,
+                      "judge_version": TURN_JUDGE_VERSION, "depth": 0, "phase": "evaluate",
+                      "frontier": [], "pending": [], "generation_queue": [],
+                      "sibling_ops": {}, "generation_failures": 0, "stop_reason": None}
+        checkpoint = self.logger.run_dir / "checkpoint.json"
+        if resume:
+            self.state = json.loads(checkpoint.read_text(encoding="utf-8"))
+            if self.state["fingerprint"] != logger.fingerprint or self.state["judge_version"] != TURN_JUDGE_VERSION:
+                raise ValueError("checkpoint configuration/judge changed; rejudge rather than mixing scores")
+            self.candidates = {cid: TurnCandidate.from_dict(value) for cid, value in self.state.pop("candidates").items()}
+            self.summaries = {cid: TurnSummary(**value) for cid, value in self.state.pop("summaries").items()}
+            for row in _read_jsonl(logger.run_dir / "trials.jsonl"):
+                if row["candidate_id"] in self.candidates:
+                    self.trials.setdefault(row["candidate_id"], []).append(TurnTrialResult.from_dict(row))
+            # A summary may have reached disk immediately before the checkpoint write.
+            for row in _read_jsonl(logger.run_dir / "summaries.jsonl"):
+                if row["candidate_id"] in self.candidates:
+                    self.summaries[row["candidate_id"]] = TurnSummary(**{
+                        key: value for key, value in row.items() if key not in ("run_id", "depth")})
+        else:
+            templates = roots or [root_template(params.renderer)]
+            if len(templates) != params.roots:
+                raise ValueError("number of roots differs from roots parameter")
+            for index, template in enumerate(templates):
+                self._preflight(template)
+                candidate = TurnCandidate(f"root{index}", template, root_id=f"root{index}")
+                if any(c.template.template_hash == template.template_hash for c in self.candidates.values()):
+                    raise ValueError("roots contain duplicate rendered payloads")
+                self.candidates[candidate.candidate_id] = candidate
+                self.state["pending"].append(candidate.candidate_id)
+                self.logger.log_candidate(candidate)
+            self._checkpoint()
+
+    def _preflight(self, template):
+        if template.renderer != self.params.renderer or len(template.messages) > self.params.max_turns:
+            raise InvalidMutation("root/candidate violates renderer or max_turns")
+        for case in self.manifest.cases:
+            self.runner.prepare_turn_case(case, template)
+
+    def _checkpoint(self):
+        self.logger.save_artifact({**self.state,
+            "candidates": {cid: candidate.as_dict() for cid, candidate in self.candidates.items()},
+            "summaries": {cid: summary.as_dict() for cid, summary in self.summaries.items()},
+            "n_candidates_evaluated": len(self.summaries),
+            "budget_used": len(self.candidates)}, "checkpoint.json")
+
+    def _rank(self, ids):
+        eligible = [cid for cid in dict.fromkeys(ids)
+                    if cid in self.summaries and self.summaries[cid].fully_evaluated]
+        return sorted(eligible, key=lambda cid: self.summaries[cid].rank_key, reverse=True)
+
+    def _evaluate(self, pool):
+        jobs = []
+        for cid in self.state["pending"]:
+            if cid in self.summaries:
+                continue
+            candidate = self.candidates[cid]
+            done = {(t.case_id, t.repeat_id) for t in self.trials.get(cid, [])}
+            for case in self.manifest.cases:
+                for repeat in range(self.params.repeats):
+                    if ("/".join(case), repeat) not in done:
+                        jobs.append((cid, pool.submit(evaluate_turn_trial, runner=self.runner,
+                            judge=self.judge, candidate=candidate, case=case, repeat_id=repeat)))
+        for cid, future in jobs:
+            trial, trace = future.result()
+            self.logger.log_trial(trial, trace)
+            self.trials.setdefault(cid, []).append(trial)
+            print(f"  {cid} {trial.case_id} r{trial.repeat_id}: {trial.status.value} "
+                  f"seen={trial.injection_seen} grade={trial.grade} security={trial.attack_success} "
+                  f"utility={trial.utility} termination={trial.termination}"
+                  f"{(' error=' + trial.error) if trial.error else ''}")
+        for cid in self.state["pending"]:
+            if cid not in self.summaries:
+                summary = summarize_turn_candidate(self.candidates[cid], self.manifest.cases,
+                    self.trials.get(cid, []), repeats=self.params.repeats)
+                self.summaries[cid] = summary
+                self.logger.log_summary(summary, self.candidates[cid].depth)
+                self._checkpoint()
+        self.state["frontier"] = self._rank(self.state["frontier"] + self.state["pending"])[:self.params.width]
+        self.state["pending"] = []
+        print(f"depth={self.state['depth']} evaluated={len(self.summaries)} "
+              f"frontier={self.state['frontier']} budget={len(self.candidates)}/{self.params.max_candidates}")
+        if self.state["depth"] >= self.params.depth:
+            self.state.update(phase="done", stop_reason="depth_exhausted")
+        elif len(self.candidates) >= self.params.max_candidates:
+            self.state.update(phase="done", stop_reason="budget_exhausted")
+        elif not self.state["frontier"]:
+            self.state.update(phase="done", stop_reason="all_candidates_failed")
+        else:
+            self.state["depth"] += 1
+            self.state["phase"] = "generate"
+            self.state["generation_queue"] = [cid for cid in self.state["frontier"]
+                                               for _ in range(self.params.branching_factor)]
+        self._checkpoint()
+
+    def _feedback(self, cid):
+        candidate = self.candidates[cid]
+        return turn_feedback(candidate, self.summaries[cid], self.trials.get(cid, []),
+                             self.summaries.get(candidate.parent_id))
+
+    def _generate(self, pool):
+        queue = self.state["generation_queue"]
+        while queue and len(self.candidates) < self.params.max_candidates:
+            count = min(self.concurrency, len(queue), self.params.max_candidates - len(self.candidates))
+            batch = [(cid, pool.submit(self.mutator.generate, self.candidates[cid], self._feedback(cid),
+                       list(self.state["sibling_ops"].get(cid, [])))) for cid in queue[:count]]
+            for cid, future in batch:
+                attempts, usage = future.result()
+                parent = self.candidates[cid]
+                self.logger.log_mutation({"parent_id": cid, "depth": self.state["depth"],
+                                          "attempts": attempts, **usage})
+                for attempt in attempts:
+                    operation, reason = attempt["op"], attempt["invalid_reason"]
+                    template = None
+                    if reason is None:
+                        try:
+                            template = apply_operation(parent.template, operation, self.params.max_turns)
+                            if operation_key(operation) in self.state["sibling_ops"].get(cid, []):
+                                raise InvalidMutation("duplicate operation for this parent")
+                            if any(c.template.template_hash == template.template_hash for c in self.candidates.values()):
+                                raise InvalidMutation("duplicate rendered payload")
+                            self._preflight(template)
+                        except Exception as exc:
+                            reason = f"{type(exc).__name__}: {exc}"
+                    if reason is not None:
+                        self.state["generation_failures"] += 1
+                        self.logger.log_invalid_candidate({"candidate_id": secrets.token_hex(8),
+                            "parent_id": cid, "depth": self.state["depth"], "op": operation,
+                            "messages": template.messages if template else None,
+                            "rendered_text": template.render("{goal}") if template else None,
+                            "raw": attempt["raw"], "invalid_reason": reason})
+                        print(f"  discarded mutation of {cid}: {reason}")
+                        continue
+                    candidate = TurnCandidate(secrets.token_hex(8), template, cid, parent.root_id,
+                        self.state["depth"], operation, [*parent.history, operation])
+                    self.candidates[candidate.candidate_id] = candidate
+                    self.state["pending"].append(candidate.candidate_id)
+                    self.state["sibling_ops"].setdefault(cid, []).append(operation_key(operation))
+                    self.logger.log_candidate(candidate)
+                    print(f"  generated {candidate.candidate_id} from {cid}: {operation['op']} "
+                          f"turns={len(template.messages)}")
+                del queue[0]
+                self._checkpoint()
+        queue.clear()
+        if self.state["pending"]:
+            self.state["phase"] = "evaluate"
+        else:
+            self.state.update(phase="done", stop_reason="no_unique_candidates")
+        self._checkpoint()
+
+    def _save_best(self):
+        ranked = self._rank(self.candidates)
+        if not ranked:
+            return None
+        best = self.candidates[ranked[0]]
+        op_deltas = {}
+        for cid, candidate in self.candidates.items():
+            if not candidate.operation or candidate.parent_id not in self.summaries or cid not in self.summaries:
+                continue
+            child, parent = self.summaries[cid], self.summaries[candidate.parent_id]
+            if not child.fully_evaluated or not parent.fully_evaluated:
+                continue
+            op_deltas.setdefault(candidate.operation["op"], []).append(
+                (child.security_rate - parent.security_rate, child.mean_grade - parent.mean_grade))
+        self.logger.save_artifact({"stop_reason": self.state["stop_reason"],
+            "n_candidates_evaluated": len(self.summaries),
+            "generation_failures": self.state["generation_failures"],
+            "ranked_candidates": ranked,
+            "op_mean_deltas": {op: {"n": len(rows),
+                "security_rate": sum(r[0] for r in rows) / len(rows),
+                "mean_grade": sum(r[1] for r in rows) / len(rows)} for op, rows in op_deltas.items()}},
+            "search_report.json")
+        self.logger.save_artifact({**best.as_dict(), "summary": self.summaries[best.candidate_id].as_dict(),
+            "selection": "training_only", "judge_version": TURN_JUDGE_VERSION,
+            "train_manifest_hash": self.manifest.manifest_hash}, "best_payload.json")
+        return best
+
+    def run(self):
+        with ThreadPoolExecutor(max_workers=self.concurrency) as pool:
+            while self.state["phase"] != "done":
+                if self.state["phase"] == "evaluate":
+                    self._evaluate(pool)
+                elif self.state["phase"] == "generate":
+                    self._generate(pool)
+                else:
+                    raise ValueError("invalid checkpoint phase")
+        return self._save_best()

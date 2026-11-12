@@ -1,0 +1,17 @@
+{
+  "env_file": "endpoint-minimax-m3.env",
+  "llm": {"provider": "vllm", "model": "minimax-m3", "request_timeout": 180, "max_retries": 2},
+  "mutator": {"temperature": 1.0, "max_tokens": 4096},
+  "target": {"temperature": 0.0, "max_tokens": 4096},
+  "evaluator": {"temperature": 0.0, "max_tokens": 2048},
+  "manifest": "data/universal/train.json",
+  "tool_catalog": "data/tool_catalog",
+  "roots_file": "data/turn_seeds.json",
+  "max_tool_iters": 15,
+  "concurrency": 8,
+  "turn_search": {
+    "roots": 1, "branching_factor": 3, "width": 8, "depth": 5,
+    "max_turns": 13, "max_candidates": 73, "repeats": 1,
+    "renderer": "plain_roles", "max_generation_attempts": 3
+  }
+}

@@ -37,9 +37,9 @@
 先启动本地 vLLM（2 个节点，空闲时也计费，用完 `scancel`）：
 
 ```bash
-cd ../structural_attack && sbatch vllm/serve_multinode.sh
+cd ../structural_attack && sbatch -J vllm-minimax-m3 vllm/serve_multinode.sh minimax-m3
 # 日志出现 "ready:" 后，把 endpoint 文件复制过来（每次重启都要重新复制）
-cp vllm/endpoint-qwen3-235b-a22b-instruct-2507.env ../TAP/
+cp vllm/endpoint-minimax-m3.env ../TAP/
 ```
 
 然后在本目录下运行：
@@ -55,7 +55,7 @@ python main_universal_tap.py eval --manifest data/universal/test.json \
 python main_universal_tap.py baselines                               # 不注入时的基线
 ```
 
-输出同时显示在 terminal 和 run 目录的 `log.txt` 里。run 目录默认是新建的 `runs/universal/<命令>-<时间>`。常用参数：
+输出同时显示在 terminal 和 run 目录的 `log.txt` 里。旧 prefix/suffix 模式默认保存到 `runs/universal/<命令>-<时间>`，轮级模式默认保存到 `runs/turn_search/<命令>-<时间>`。常用参数：
 
 - `--manifest`：换一组任务
 - `--run-dir`：指定输出目录
@@ -63,6 +63,69 @@ python main_universal_tap.py baselines                               # 不注入
 - search 专用：`--roots/--branching-factor/--width/--depth/--repeats`，覆盖配置里的值
 
 ## 配置
+
+### 轮级搜索
+
+`turn-search` 实现 [turn_search_plan.md](turn_search_plan.md)：每个子节点只执行一个
+insert / rewrite / delete，保留父节点参与排序，先比较真实 security 成功率，再比较
+0–4 平均等级，最后优先选择更少的轮数。默认根是 `user: {goal}`，在深度 0 评估。
+`--roots 2` 会额外评估 [人工 seed](data/turn_seeds.json)。
+
+三个独立 client 为 `target`、`evaluator`、`mutator`；新配置全部使用 `minimax-m3`。
+mutator 仅接收静态工具目录和匿名行为反馈。evaluator 只看首次注入 tool response
+之后的真实完整轨迹，给出 A/B/C 标签、证据消息 ID 和理由；真实 security 成功直接记等级 4。
+拒绝、工具错误和步数上限按行为结果记录；API 请求有限次重试，judge 解析重试不重跑 target。
+
+```bash
+# 既有环境；默认读取 endpoint-minimax-m3.env
+source ../structural_attack/.venv/bin/activate
+python -m unittest discover -s tests -v
+python main_universal_tap.py turn-search --config configs/turn_smoke.json \
+  --run-dir runs/turn_search/turn-smoke
+
+# 相同配置恢复；已记录的 trial 不再调用 target / evaluator
+python main_universal_tap.py turn-search --config configs/turn_smoke.json \
+  --run-dir runs/turn_search/turn-smoke --resume
+
+# train18；默认 plain_roles，可固定为 M3 原生标签
+python main_universal_tap.py turn-search --renderer minimax_m3_chat
+
+# 在冻结 payload 上评估；renderer 从 JSON 读取
+python main_universal_tap.py turn-eval --config configs/turn_smoke.json \
+  --payload runs/turn_search/turn-smoke/best_payload.json
+
+# 修改 judge 后，对所有已有轨迹重新判级，target 请求数为 0
+python main_universal_tap.py turn-rejudge --source-run runs/turn_search/turn-smoke \
+  --run-dir runs/turn_search/turn-rejudged
+
+# 训练结束后，top-k 在验证集 repeats>=3 选择，再在 test 上评估一次
+python main_universal_tap.py turn-select --source-run runs/turn_search/turn-train \
+  --run-dir runs/turn_search/turn-selected --top-k 3 --repeats 3
+```
+
+`configs/turn_smoke.json` 为单 case、width=2、branching=2、depth=5、max_turns=13、max_candidates=7；
+预算包含根，因此通常在深度 2 用完。需要走完深度 5 时加 `--max-candidates 19`。
+`configs/turn_train18.json` 使用 train18、width=8、branching=3、depth=5、max_turns=13、max_candidates=73。
+`--concurrency` 同时控制 mutation 和 rollout 并发。
+
+轮级 run 另存 `checkpoint.json`、`best_payload.json`、`search_report.json` 和
+`mutations.jsonl`。`trials.jsonl` 包含完整轨迹、等级、环境结果、错误、token 和耗时。
+非法候选及原因记入 `candidates.jsonl`，不消耗评估预算；缺失 trial 不缩小分母，
+评估不完整的候选不参与排序。恢复时核对配置、任务、seed、工具目录和 judge 版本。
+搜索输出的 payload 标记为 `training_only`；`turn-select` 的最终选择只比较真实
+security、utility 及轮数，不使用代理等级。验证和测试结果不会进入 mutator。
+
+在 AgentDojo 的其它命令中使用相同注入实现：
+
+```bash
+export MULTITURN_FROM_SEARCH_PAYLOAD="$PWD/runs/turn_search/turn-smoke/best_payload.json"
+# 在既有 AgentDojo 命令中加：-ml my_attacks --attack multiturn_from_search
+```
+
+新 attack 继承 `OneTurnAttack`，复用其工具边界和 YAML 转义。默认 `plain_roles`
+直接复用 `_render_generic`；`minimax_m3_chat` 使用 M3 角色及工具调用标签。
+
+### 原 prefix/suffix 模式
 
 | 文件 | 内容 |
 |---|---|
@@ -123,7 +186,8 @@ main_universal_tap.py search
 | `universal_tap/records.py` | `RunLogger`：写入 run 目录里的所有文件（见上面的"输出"），并把 terminal 输出同时写进 `log.txt`。 |
 | `configs/*.json` | 运行配置：模型、endpoint 文件、任务清单、搜索参数。 |
 | `data/universal/*.json` | 任务清单：每个任务对是 (suite, user_task_id, injection_task_id)。 |
-| `runs/universal/` | 各次运行的结果。 |
+| `runs/universal/` | 原 Universal TAP（prefix/suffix）的运行结果。 |
+| `runs/turn_search/` | 轮级搜索、评估、重判及验证集选择的运行结果。 |
 | `AGENT.md` | 研究背景和使用边界说明。 |
 | `plan.md` | 详细的实施计划，包括各阶段的验收标准和设计取舍。 |
 | `universal_TAP.pdf` | 论文。 |
