@@ -4,32 +4,222 @@
   "cases": [
     {
       "suite": "workspace",
+      "user_task_id": "user_task_0",
+      "injection_task_id": "injection_task_0"
+    },
+    {
+      "suite": "workspace",
+      "user_task_id": "user_task_1",
+      "injection_task_id": "injection_task_0"
+    },
+    {
+      "suite": "workspace",
       "user_task_id": "user_task_2",
-      "injection_task_id": "injection_task_2"
+      "injection_task_id": "injection_task_0"
+    },
+    {
+      "suite": "workspace",
+      "user_task_id": "user_task_3",
+      "injection_task_id": "injection_task_0"
+    },
+    {
+      "suite": "workspace",
+      "user_task_id": "user_task_1",
+      "injection_task_id": "injection_task_6"
+    },
+    {
+      "suite": "workspace",
+      "user_task_id": "user_task_2",
+      "injection_task_id": "injection_task_6"
+    },
+    {
+      "suite": "workspace",
+      "user_task_id": "user_task_3",
+      "injection_task_id": "injection_task_6"
+    },
+    {
+      "suite": "workspace",
+      "user_task_id": "user_task_4",
+      "injection_task_id": "injection_task_6"
+    },
+    {
+      "suite": "workspace",
+      "user_task_id": "user_task_1",
+      "injection_task_id": "injection_task_7"
+    },
+    {
+      "suite": "workspace",
+      "user_task_id": "user_task_3",
+      "injection_task_id": "injection_task_7"
+    },
+    {
+      "suite": "workspace",
+      "user_task_id": "user_task_4",
+      "injection_task_id": "injection_task_7"
+    },
+    {
+      "suite": "workspace",
+      "user_task_id": "user_task_6",
+      "injection_task_id": "injection_task_7"
     },
     {
       "suite": "workspace",
       "user_task_id": "user_task_5",
-      "injection_task_id": "injection_task_3"
+      "injection_task_id": "injection_task_11"
+    },
+    {
+      "suite": "workspace",
+      "user_task_id": "user_task_11",
+      "injection_task_id": "injection_task_11"
+    },
+    {
+      "suite": "workspace",
+      "user_task_id": "user_task_13",
+      "injection_task_id": "injection_task_11"
+    },
+    {
+      "suite": "workspace",
+      "user_task_id": "user_task_21",
+      "injection_task_id": "injection_task_11"
     },
     {
       "suite": "banking",
       "user_task_id": "user_task_3",
-      "injection_task_id": "injection_task_2"
+      "injection_task_id": "injection_task_0"
     },
     {
       "suite": "banking",
+      "user_task_id": "user_task_5",
+      "injection_task_id": "injection_task_0"
+    },
+    {
+      "suite": "banking",
+      "user_task_id": "user_task_8",
+      "injection_task_id": "injection_task_0"
+    },
+    {
+      "suite": "banking",
+      "user_task_id": "user_task_10",
+      "injection_task_id": "injection_task_0"
+    },
+    {
+      "suite": "banking",
+      "user_task_id": "user_task_2",
+      "injection_task_id": "injection_task_1"
+    },
+    {
+      "suite": "banking",
+      "user_task_id": "user_task_3",
+      "injection_task_id": "injection_task_1"
+    },
+    {
+      "suite": "banking",
+      "user_task_id": "user_task_5",
+      "injection_task_id": "injection_task_1"
+    },
+    {
+      "suite": "banking",
+      "user_task_id": "user_task_6",
+      "injection_task_id": "injection_task_1"
+    },
+    {
+      "suite": "banking",
+      "user_task_id": "user_task_1",
+      "injection_task_id": "injection_task_6"
+    },
+    {
+      "suite": "banking",
+      "user_task_id": "user_task_6",
+      "injection_task_id": "injection_task_6"
+    },
+    {
+      "suite": "banking",
+      "user_task_id": "user_task_8",
+      "injection_task_id": "injection_task_6"
+    },
+    {
+      "suite": "banking",
+      "user_task_id": "user_task_10",
+      "injection_task_id": "injection_task_6"
+    },
+    {
+      "suite": "travel",
+      "user_task_id": "user_task_0",
+      "injection_task_id": "injection_task_0"
+    },
+    {
+      "suite": "travel",
+      "user_task_id": "user_task_1",
+      "injection_task_id": "injection_task_0"
+    },
+    {
+      "suite": "travel",
+      "user_task_id": "user_task_3",
+      "injection_task_id": "injection_task_0"
+    },
+    {
+      "suite": "travel",
+      "user_task_id": "user_task_4",
+      "injection_task_id": "injection_task_0"
+    },
+    {
+      "suite": "travel",
+      "user_task_id": "user_task_1",
+      "injection_task_id": "injection_task_2"
+    },
+    {
+      "suite": "travel",
+      "user_task_id": "user_task_2",
+      "injection_task_id": "injection_task_2"
+    },
+    {
+      "suite": "travel",
+      "user_task_id": "user_task_3",
+      "injection_task_id": "injection_task_2"
+    },
+    {
+      "suite": "travel",
+      "user_task_id": "user_task_4",
+      "injection_task_id": "injection_task_2"
+    },
+    {
+      "suite": "slack",
       "user_task_id": "user_task_4",
       "injection_task_id": "injection_task_3"
     },
     {
       "suite": "slack",
-      "user_task_id": "user_task_2",
+      "user_task_id": "user_task_5",
       "injection_task_id": "injection_task_3"
     },
     {
       "suite": "slack",
+      "user_task_id": "user_task_6",
+      "injection_task_id": "injection_task_3"
+    },
+    {
+      "suite": "slack",
+      "user_task_id": "user_task_7",
+      "injection_task_id": "injection_task_3"
+    },
+    {
+      "suite": "slack",
+      "user_task_id": "user_task_1",
+      "injection_task_id": "injection_task_4"
+    },
+    {
+      "suite": "slack",
       "user_task_id": "user_task_5",
+      "injection_task_id": "injection_task_4"
+    },
+    {
+      "suite": "slack",
+      "user_task_id": "user_task_6",
+      "injection_task_id": "injection_task_4"
+    },
+    {
+      "suite": "slack",
+      "user_task_id": "user_task_8",
       "injection_task_id": "injection_task_4"
     }
   ]

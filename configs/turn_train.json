@@ -8,10 +8,10 @@
   "tool_catalog": "data/tool_catalog",
   "roots_file": "data/turn_seeds.json",
   "max_tool_iters": 15,
-  "concurrency": 8,
+  "concurrency": 32,
   "turn_search": {
-    "roots": 1, "branching_factor": 3, "width": 8, "depth": 5,
-    "max_turns": 13, "max_candidates": 73, "repeats": 1,
+    "roots": 1, "branching_factor": 4, "width": 16, "depth": 5,
+    "max_turns": 13, "max_candidates": 256, "repeats": 2,
     "renderer": "plain_roles", "max_generation_attempts": 3
   }
 }

@@ -377,7 +377,7 @@ class UniversalTAPSearch:
 from pathlib import Path
 
 from .evaluation import (TurnJudge, evaluate_turn_trial, summarize_turn_candidate, turn_feedback)
-from .prompts import TURN_JUDGE_VERSION, turn_mutator_system_prompt
+from .prompts import TURN_JUDGE_VERSION, TURN_MUTATOR_VERSION, turn_mutator_system_prompt
 from .schemas import TurnSummary, TurnTrialResult
 from .turns import (InvalidMutation, TurnCandidate, TurnTemplate, apply_operation,
                     operation_key, parse_json_object, root_template)
@@ -435,8 +435,11 @@ class TurnMutator:
         self.system_prompt = turn_mutator_system_prompt(tool_catalog, max_turns)
 
     def generate(self, parent: TurnCandidate, feedback: dict, excluded: list[str]):
+        feedback = dict(feedback)
+        previous_variants = feedback.pop("previous_variants", [])
         messages = [{"role": "system", "content": self.system_prompt},
                     {"role": "user", "content": json.dumps({"feedback": feedback,
+                        "previous_sibling_variants": previous_variants,
                         "excluded_sibling_operations": [json.loads(op) for op in excluded]}, ensure_ascii=False)}]
         attempts = []
         start = time.monotonic()
@@ -448,6 +451,8 @@ class TurnMutator:
                     raw = response.choices[0].message.content or ""
                     operation = parse_json_object(raw)
                     template = apply_operation(parent.template, operation, self.max_turns)
+                    if not isinstance(operation.get("reason"), str) or not operation["reason"].strip():
+                        raise InvalidMutation("reason must be a nonempty brief mutation rationale")
                     if operation_key(operation) in excluded:
                         raise InvalidMutation("duplicate operation for this parent")
                     if template.template_hash == parent.template.template_hash:
@@ -490,7 +495,8 @@ class TurnTAPSearch:
         self.summaries: dict[str, TurnSummary] = {}
         self.trials: dict[str, list[TurnTrialResult]] = {}
         self.state = {"version": 1, "fingerprint": logger.fingerprint,
-                      "judge_version": TURN_JUDGE_VERSION, "depth": 0, "phase": "evaluate",
+                      "judge_version": TURN_JUDGE_VERSION, "mutator_version": TURN_MUTATOR_VERSION,
+                      "depth": 0, "phase": "evaluate",
                       "frontier": [], "pending": [], "generation_queue": [],
                       "sibling_ops": {}, "generation_failures": 0, "stop_reason": None}
         checkpoint = self.logger.run_dir / "checkpoint.json"
@@ -498,6 +504,8 @@ class TurnTAPSearch:
             self.state = json.loads(checkpoint.read_text(encoding="utf-8"))
             if self.state["fingerprint"] != logger.fingerprint or self.state["judge_version"] != TURN_JUDGE_VERSION:
                 raise ValueError("checkpoint configuration/judge changed; rejudge rather than mixing scores")
+            if self.state.get("mutator_version") != TURN_MUTATOR_VERSION:
+                raise ValueError("checkpoint mutation protocol changed; start a new run directory")
             self.candidates = {cid: TurnCandidate.from_dict(value) for cid, value in self.state.pop("candidates").items()}
             self.summaries = {cid: TurnSummary(**value) for cid, value in self.state.pop("summaries").items()}
             for row in _read_jsonl(logger.run_dir / "trials.jsonl"):
@@ -586,19 +594,39 @@ class TurnTAPSearch:
 
     def _feedback(self, cid):
         candidate = self.candidates[cid]
-        return turn_feedback(candidate, self.summaries[cid], self.trials.get(cid, []),
-                             self.summaries.get(candidate.parent_id))
+        feedback = turn_feedback(candidate, self.summaries[cid], self.trials.get(cid, []),
+                                 self.summaries.get(candidate.parent_id))
+        # Accepted children already carry both the full payload and its rationale in
+        # the checkpoint, so incremental context survives resume and repeated depths.
+        feedback["previous_variants"] = [
+            {"candidate_id": child.candidate_id, "messages": child.template.as_dict()["messages"],
+             "operation": {k: v for k, v in child.operation.items() if k != "reason"},
+             "reason": child.operation.get("reason", "")}
+            for child in self.candidates.values() if child.parent_id == cid]
+        return feedback
 
     def _generate(self, pool):
         queue = self.state["generation_queue"]
         while queue and len(self.candidates) < self.params.max_candidates:
             count = min(self.concurrency, len(queue), self.params.max_candidates - len(self.candidates))
-            batch = [(cid, pool.submit(self.mutator.generate, self.candidates[cid], self._feedback(cid),
-                       list(self.state["sibling_ops"].get(cid, [])))) for cid in queue[:count]]
-            for cid, future in batch:
+            # At most one outstanding generation per parent. Different parents can
+            # run concurrently; a sibling waits until its predecessor is persisted.
+            batch, parents = [], set()
+            for cid in queue:
+                if cid in parents:
+                    continue
+                feedback = self._feedback(cid)
+                future = pool.submit(self.mutator.generate, self.candidates[cid], feedback,
+                                     list(self.state["sibling_ops"].get(cid, [])))
+                batch.append((cid, future, [v["candidate_id"] for v in feedback["previous_variants"]]))
+                parents.add(cid)
+                if len(batch) == count:
+                    break
+            for cid, future, previous_ids in batch:
                 attempts, usage = future.result()
                 parent = self.candidates[cid]
                 self.logger.log_mutation({"parent_id": cid, "depth": self.state["depth"],
+                                          "previous_variant_ids": previous_ids,
                                           "attempts": attempts, **usage})
                 for attempt in attempts:
                     operation, reason = attempt["op"], attempt["invalid_reason"]
@@ -630,7 +658,7 @@ class TurnTAPSearch:
                     self.logger.log_candidate(candidate)
                     print(f"  generated {candidate.candidate_id} from {cid}: {operation['op']} "
                           f"turns={len(template.messages)}")
-                del queue[0]
+                queue.remove(cid)
                 self._checkpoint()
         queue.clear()
         if self.state["pending"]:

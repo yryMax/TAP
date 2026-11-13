@@ -289,7 +289,7 @@ def guard_turn_output(args):
 def cmd_turn_search(args):
     import hashlib
     from universal_tap.evaluation import TurnJudge
-    from universal_tap.prompts import TURN_JUDGE_VERSION
+    from universal_tap.prompts import TURN_JUDGE_VERSION, TURN_MUTATOR_VERSION
     from universal_tap.search import TurnMutator, TurnTAPSearch, load_tool_catalog
     from universal_tap.turns import TurnTemplate, root_template
 
@@ -308,6 +308,7 @@ def cmd_turn_search(args):
     catalog_hash = hashlib.sha256(json.dumps(catalog, sort_keys=True).encode()).hexdigest()[:16]
     run = start_run(args, config, ("target", "evaluator", "mutator"), turn_search=params.as_dict(),
                     injection_strategy="one_turn_boundaries", judge_version=TURN_JUDGE_VERSION,
+                    mutator_version=TURN_MUTATOR_VERSION,
                     tool_catalog_hash=catalog_hash, root_hashes=[root.template_hash for root in roots])
     print(f"Turn search: {params.as_dict()} concurrency={concurrency(args, config)}")
     print(f"Training: {run.manifest.name} ({len(run.manifest.cases)} cases)")
@@ -556,7 +557,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_search)
 
     p = sub.add_parser("turn-search", parents=[copy.deepcopy(run_opts)], help="search a shared forged multi-turn dialogue")
-    p.set_defaults(config="configs/turn_train18.json", func=cmd_turn_search)
+    p.set_defaults(config="configs/turn_train.json", func=cmd_turn_search)
     for flag in ("--roots", "--branching-factor", "--width", "--depth", "--repeats", "--max-turns", "--max-candidates"):
         p.add_argument(flag, type=int, default=None)
     p.add_argument("--renderer", choices=("plain_roles", "minimax_m3_chat"), default=None)
@@ -565,22 +566,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--resume", action="store_true")
 
     p = sub.add_parser("turn-eval", parents=[copy.deepcopy(run_opts)], help="evaluate a frozen multi-turn payload")
-    p.set_defaults(config="configs/turn_train18.json", func=cmd_turn_eval)
+    p.set_defaults(config="configs/turn_train.json", func=cmd_turn_eval)
     p.add_argument("--payload", required=True)
     p.add_argument("--repeats", type=int, default=1)
     p.add_argument("--resume", action="store_true")
 
     p = sub.add_parser("turn-select", parents=[copy.deepcopy(run_opts)], help="top-k validation selection, then one held-out test")
-    p.set_defaults(config="configs/turn_train18.json", func=cmd_turn_select)
+    p.set_defaults(config="configs/turn_train.json", func=cmd_turn_select)
     p.add_argument("--source-run", required=True)
     p.add_argument("--validation-manifest", default="data/universal/validation.json")
     p.add_argument("--test-manifest", default="data/universal/test.json")
-    p.add_argument("--top-k", type=int, default=3)
+    p.add_argument("--top-k", type=int, default=5)
     p.add_argument("--repeats", type=int, default=3)
     p.add_argument("--resume", action="store_true")
 
     p = sub.add_parser("turn-rejudge", parents=[copy.deepcopy(run_opts)], help="rejudge every saved training trajectory")
-    p.set_defaults(config="configs/turn_train18.json", func=cmd_turn_rejudge)
+    p.set_defaults(config="configs/turn_train.json", func=cmd_turn_rejudge)
     p.add_argument("--source-run", required=True)
     p.add_argument("--resume", action="store_true")
     return parser
