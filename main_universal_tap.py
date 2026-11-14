@@ -380,6 +380,7 @@ def cmd_turn_eval(args):
 def cmd_turn_select(args):
     """Held-out selection runs separately; no mutator client or feedback is involved."""
     from universal_tap.prompts import TURN_JUDGE_VERSION
+    from universal_tap.evaluation import rank_turn_candidates
     from universal_tap.schemas import TurnSummary
     from universal_tap.turns import TurnCandidate
     if args.repeats < 3 or args.top_k < 1:
@@ -391,8 +392,7 @@ def cmd_turn_select(args):
         raise ValueError("finish training before held-out selection")
     candidates = {cid: TurnCandidate.from_dict(value) for cid, value in checkpoint["candidates"].items()}
     summaries = {cid: TurnSummary(**value) for cid, value in checkpoint["summaries"].items()}
-    eligible = [cid for cid in candidates if cid in summaries and summaries[cid].fully_evaluated]
-    eligible.sort(key=lambda cid: summaries[cid].rank_key, reverse=True)
+    eligible = rank_turn_candidates(candidates, summaries)
     chosen = [candidates[cid] for cid in eligible[:args.top_k]]
     if not chosen:
         raise ValueError("no fully evaluated training candidates")
@@ -445,7 +445,8 @@ def cmd_turn_select(args):
 
 def cmd_turn_rejudge(args):
     from universal_tap.agent import RunOutput
-    from universal_tap.evaluation import TurnJudge, judge_turn_output, summarize_turn_candidate
+    from universal_tap.evaluation import (TurnJudge, judge_turn_output, rank_turn_candidates,
+                                          summarize_turn_candidate)
     from universal_tap.prompts import TURN_JUDGE_VERSION
     from universal_tap.schemas import RunStatus, TurnTrialResult
     from universal_tap.search import _read_jsonl
@@ -512,8 +513,7 @@ def cmd_turn_rejudge(args):
             [trial for trial in results if trial.candidate_id == cid], repeats=run.logger.run_config["repeats"])
         run.logger.log_summary(summary, candidate.depth)
         summaries[cid] = summary
-    ranked = sorted((cid for cid in candidates if summaries[cid].fully_evaluated),
-                    key=lambda cid: summaries[cid].rank_key, reverse=True)
+    ranked = rank_turn_candidates(candidates, summaries)
     run.logger.save_artifact({**checkpoint, "fingerprint": run.logger.fingerprint,
         "judge_version": TURN_JUDGE_VERSION, "summaries": {cid: s.as_dict() for cid, s in summaries.items()}},
         "checkpoint.json")

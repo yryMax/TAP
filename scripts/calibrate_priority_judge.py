@@ -6,7 +6,6 @@ Remove --dry-run to query only the configured evaluator on these ten fixtures.
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import replace
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -74,9 +73,8 @@ def cases():
 
 
 def main():
-    from main_universal_tap import model_configs
+    from main_universal_tap import load_config, make_clients
     from universal_tap.evaluation import TurnJudge
-    from universal_tap.llm import build_clients
     from universal_tap.prompts import TURN_JUDGE_VERSION
 
     parser = argparse.ArgumentParser(description=__doc__)
@@ -96,15 +94,7 @@ def main():
     if args.dry_run:
         print(f"Saved {len(fixtures)} fixtures to {output}; model requests: 0")
         return 0
-    config = json.loads(Path(args.config).read_text())
-    evaluator = replace(model_configs(config)["evaluator"], request_timeout=30, max_retries=0)
-    client = build_clients({"evaluator": evaluator}, args.env_file or config.get("env_file"))["evaluator"]
-    try:
-        client.openai_client._inner.models.list(timeout=10)
-    except Exception as exc:
-        (output / "endpoint_error.txt").write_text(f"{type(exc).__name__}: {exc}\n")
-        print(f"Evaluator endpoint unavailable ({type(exc).__name__}); no calibration completion requests sent.")
-        return 2
+    client = make_clients(args, load_config(args), ("evaluator",))["evaluator"]
     judge = TurnJudge(client, max_attempts=2)
 
     def evaluate(case):
@@ -115,7 +105,7 @@ def main():
 
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         results = list(pool.map(evaluate, fixtures))
-    report = {"judge_version": TURN_JUDGE_VERSION, "model": evaluator.as_dict(),
+    report = {"judge_version": TURN_JUDGE_VERSION, "model": client.config.as_dict(),
               "n_cases": len(results), "n_matched": sum(row["matched"] for row in results),
               "usage": client.usage.as_dict(), "target_requests": 0, "results": results}
     (output / "results.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")

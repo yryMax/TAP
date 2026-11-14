@@ -1,20 +1,7 @@
-"""Universal TAP search loop: branch, evaluate, prune, feed back.
+"""Prefix/suffix TAP and incremental turn-level beam search.
 
-Depth 1: each of ``roots`` fresh attacker conversations branches ``branching_factor``
-times. Each later depth: every surviving branch asks the attacker for
-``branching_factor`` new templates (prefix/suffix/improvement). Candidates are validated
-and de-duplicated (there is no on-topic pruning), each one is evaluated on the *whole*
-training set, the top ``width`` by mean judge score survive (seeded tie-break), and the
-survivors receive aggregated feedback for the next depth. With roots=3, branching=3,
-width=8, depth=5 the depths have 9, 24, 24, 24, 24 candidates.
-
-The attacker's reply is appended to its branch history and feedback is a separate later
-user turn. Progress is printed in the style of the original TAP.
-
-Within a depth, all attacker requests run concurrently, and so do all
-(candidate, task, repeat) rollouts, through one pool of ``concurrency`` threads. Results
-are logged and printed in candidate order from the main thread, so the logs read the
-same as a sequential run.
+Generation and rollouts use a thread pool; turn-level siblings are generated serially.
+The main thread records results in candidate order.
 """
 
 from __future__ import annotations
@@ -376,10 +363,11 @@ class UniversalTAPSearch:
 # Turn-level mode keeps the original prefix/suffix implementation above intact.
 from pathlib import Path
 
-from .evaluation import (TurnJudge, evaluate_turn_trial, summarize_turn_candidate, turn_feedback)
+from .evaluation import (evaluate_turn_trial, rank_turn_candidates,
+                         summarize_turn_candidate, turn_feedback)
 from .prompts import TURN_JUDGE_VERSION, TURN_MUTATOR_VERSION, turn_mutator_system_prompt
 from .schemas import TurnSummary, TurnTrialResult
-from .turns import (InvalidMutation, TurnCandidate, TurnTemplate, apply_operation,
+from .turns import (InvalidMutation, TurnCandidate, apply_operation,
                     operation_key, parse_json_object, root_template)
 
 
@@ -439,8 +427,7 @@ class TurnMutator:
         previous_variants = feedback.pop("previous_variants", [])
         messages = [{"role": "system", "content": self.system_prompt},
                     {"role": "user", "content": json.dumps({"feedback": feedback,
-                        "previous_sibling_variants": previous_variants,
-                        "excluded_sibling_operations": [json.loads(op) for op in excluded]}, ensure_ascii=False)}]
+                        "previous_sibling_variants": previous_variants}, ensure_ascii=False)}]
         attempts = []
         start = time.monotonic()
         with self.client.track() as usage:
@@ -543,11 +530,6 @@ class TurnTAPSearch:
             "n_candidates_evaluated": len(self.summaries),
             "budget_used": len(self.candidates)}, "checkpoint.json")
 
-    def _rank(self, ids):
-        eligible = [cid for cid in dict.fromkeys(ids)
-                    if cid in self.summaries and self.summaries[cid].fully_evaluated]
-        return sorted(eligible, key=lambda cid: self.summaries[cid].rank_key, reverse=True)
-
     def _evaluate(self, pool):
         jobs = []
         for cid in self.state["pending"]:
@@ -575,7 +557,8 @@ class TurnTAPSearch:
                 self.summaries[cid] = summary
                 self.logger.log_summary(summary, self.candidates[cid].depth)
                 self._checkpoint()
-        self.state["frontier"] = self._rank(self.state["frontier"] + self.state["pending"])[:self.params.width]
+        self.state["frontier"] = rank_turn_candidates(
+            self.state["frontier"] + self.state["pending"], self.summaries)[:self.params.width]
         self.state["pending"] = []
         print(f"depth={self.state['depth']} evaluated={len(self.summaries)} "
               f"frontier={self.state['frontier']} budget={len(self.candidates)}/{self.params.max_candidates}")
@@ -596,32 +579,22 @@ class TurnTAPSearch:
         candidate = self.candidates[cid]
         feedback = turn_feedback(candidate, self.summaries[cid], self.trials.get(cid, []),
                                  self.summaries.get(candidate.parent_id))
-        # Accepted children already carry both the full payload and its rationale in
-        # the checkpoint, so incremental context survives resume and repeated depths.
-        feedback["previous_variants"] = [
-            {"candidate_id": child.candidate_id, "messages": child.template.as_dict()["messages"],
-             "operation": {k: v for k, v in child.operation.items() if k != "reason"},
-             "reason": child.operation.get("reason", "")}
-            for child in self.candidates.values() if child.parent_id == cid]
+        feedback["previous_variants"] = [child.mutation_context() for child in self.candidates.values()
+                                         if child.parent_id == cid]
         return feedback
 
     def _generate(self, pool):
         queue = self.state["generation_queue"]
         while queue and len(self.candidates) < self.params.max_candidates:
-            count = min(self.concurrency, len(queue), self.params.max_candidates - len(self.candidates))
-            # At most one outstanding generation per parent. Different parents can
-            # run concurrently; a sibling waits until its predecessor is persisted.
-            batch, parents = [], set()
-            for cid in queue:
-                if cid in parents:
-                    continue
+            limit = min(self.concurrency, self.params.max_candidates - len(self.candidates))
+            # One generation per parent per batch; siblings see persisted predecessors.
+            parents = list(dict.fromkeys(queue))[:limit]
+            batch = []
+            for cid in parents:
                 feedback = self._feedback(cid)
                 future = pool.submit(self.mutator.generate, self.candidates[cid], feedback,
                                      list(self.state["sibling_ops"].get(cid, [])))
                 batch.append((cid, future, [v["candidate_id"] for v in feedback["previous_variants"]]))
-                parents.add(cid)
-                if len(batch) == count:
-                    break
             for cid, future, previous_ids in batch:
                 attempts, usage = future.result()
                 parent = self.candidates[cid]
@@ -668,7 +641,7 @@ class TurnTAPSearch:
         self._checkpoint()
 
     def _save_best(self):
-        ranked = self._rank(self.candidates)
+        ranked = rank_turn_candidates(self.candidates, self.summaries)
         if not ranked:
             return None
         best = self.candidates[ranked[0]]

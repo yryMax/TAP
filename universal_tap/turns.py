@@ -187,6 +187,11 @@ class TurnCandidate:
     operation: dict[str, Any] | None = None
     history: list[dict[str, Any]] = field(default_factory=list)
 
+    def mutation_context(self) -> dict[str, Any]:
+        """The payload and intent needed to generate another single-turn mutation."""
+        return {"candidate_id": self.candidate_id, "messages": copy.deepcopy(self.template.messages),
+                "reason": (self.operation or {}).get("reason", "")}
+
     def as_dict(self) -> dict[str, Any]:
         return {"candidate_id": self.candidate_id, **self.template.as_dict(),
                 "parent_id": self.parent_id, "root_id": self.root_id, "depth": self.depth,
